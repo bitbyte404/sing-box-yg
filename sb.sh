@@ -873,7 +873,155 @@ cat > /etc/s-box/sb11.json <<EOF
 }
 EOF
 [[ "$sbnh" == "1.10" ]] && num=10 || num=11
+apply_ext_socks5
 cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
+}
+
+# ── 外部SOCKS5落地代理 ────────────────────────────────────────
+
+apply_ext_socks5(){
+[[ ! -f /etc/s-box/ext_socks5.conf ]] && return
+local s5ip s5port s5user s5pass s5json jf
+s5ip=$(awk '{print $1}' /etc/s-box/ext_socks5.conf)
+s5port=$(awk '{print $2}' /etc/s-box/ext_socks5.conf)
+s5user=$(awk '{print $3}' /etc/s-box/ext_socks5.conf)
+s5pass=$(awk '{print $4}' /etc/s-box/ext_socks5.conf)
+if [[ -n $s5user && -n $s5pass ]]; then
+s5json='{"type":"socks","tag":"ext-socks5-out","server":"'$s5ip'","server_port":'$s5port',"version":"5","username":"'$s5user'","password":"'$s5pass'"}'
+else
+s5json='{"type":"socks","tag":"ext-socks5-out","server":"'$s5ip'","server_port":'$s5port',"version":"5"}'
+fi
+for jf in /etc/s-box/sb10.json /etc/s-box/sb11.json; do
+[[ ! -f $jf ]] && continue
+jq 'del(.outbounds[] | select(.tag == "ext-socks5-out"))' "$jf" > /tmp/_sb_s5.json && mv /tmp/_sb_s5.json "$jf"
+jq --argjson s5 "$s5json" '.outbounds += [$s5] | .route.rules[-1].outbound = "ext-socks5-out"' "$jf" > /tmp/_sb_s5.json && mv /tmp/_sb_s5.json "$jf"
+done
+}
+
+remove_ext_socks5(){
+local jf
+for jf in /etc/s-box/sb10.json /etc/s-box/sb11.json; do
+[[ ! -f $jf ]] && continue
+jq 'del(.outbounds[] | select(.tag == "ext-socks5-out")) | .route.rules[-1].outbound = "direct"' "$jf" > /tmp/_sb_s5.json && mv /tmp/_sb_s5.json "$jf"
+done
+rm -rf /etc/s-box/ext_socks5.conf
+}
+
+socks5_export_nodes(){
+[[ ! -f /etc/s-box/ext_socks5.conf ]] && red "未配置外部SOCKS5落地代理，请先选择选项1进行配置" && return
+local s5ip old_hostname
+s5ip=$(awk '{print $1}' /etc/s-box/ext_socks5.conf)
+old_hostname=$hostname
+hostname="${hostname}[S5-${s5ip}]"
+green "正在生成配合SOCKS5落地的节点配置，请稍等……"
+sbshare > /dev/null 2>&1
+cp /etc/s-box/sbox.json /etc/s-box/s5_sbox.json 2>/dev/null
+cp /etc/s-box/clmi.yaml /etc/s-box/s5_clmi.yaml 2>/dev/null
+cp /etc/s-box/jhsub.txt /etc/s-box/s5_jhsub.txt 2>/dev/null
+hostname=$old_hostname
+sbshare > /dev/null 2>&1
+echo
+white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+red "🚀 SOCKS5落地节点配置已生成 (落地IP出口：$s5ip)"
+white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+green "文件目录："
+green "  Sing-box 客户端配置：/etc/s-box/s5_sbox.json"
+green "  Clash/Mihomo 配置：  /etc/s-box/s5_clmi.yaml"
+green "  聚合订阅文本：       /etc/s-box/s5_jhsub.txt"
+echo
+blue "📋 聚合订阅链接 (节点名含 [S5-${s5ip}] 标记)："
+echo
+cat /etc/s-box/s5_jhsub.txt 2>/dev/null
+white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+}
+
+socks5_landing(){
+sbactive
+echo
+if [[ -f /etc/s-box/ext_socks5.conf ]]; then
+local _s5show_ip _s5show_port _s5show_user
+_s5show_ip=$(awk '{print $1}' /etc/s-box/ext_socks5.conf)
+_s5show_port=$(awk '{print $2}' /etc/s-box/ext_socks5.conf)
+_s5show_user=$(awk '{print $3}' /etc/s-box/ext_socks5.conf)
+green "当前外部SOCKS5落地代理：${_s5show_ip}:${_s5show_port}${_s5show_user:+  用户名:$_s5show_user}"
+else
+yellow "当前未配置外部SOCKS5落地代理"
+fi
+echo
+yellow "1：配置外部SOCKS5落地代理（更改落地IP）"
+yellow "2：查看当前状态 & 测试落地IP"
+yellow "3：导出配合SOCKS5的节点 (Sing-box / Clash / 聚合订阅)"
+yellow "4：关闭SOCKS5落地，恢复VPS本地直连"
+yellow "0：返回上层"
+readp "请选择【0-4】：" menu
+if [ "$menu" = "1" ]; then
+echo
+readp "输入SOCKS5服务器IP或域名：" s5ip
+[[ -z $s5ip ]] && red "IP/域名不能为空" && return
+readp "输入SOCKS5端口：" s5port
+[[ -z $s5port ]] && red "端口不能为空" && return
+readp "输入认证用户名（无认证直接回车跳过）：" s5user
+s5pass=""
+[[ -n $s5user ]] && readp "输入认证密码：" s5pass
+echo "${s5ip} ${s5port} ${s5user} ${s5pass}" > /etc/s-box/ext_socks5.conf
+green "正在应用SOCKS5落地配置……"
+apply_ext_socks5
+[[ "$sbnh" == "1.10" ]] && num=10 || num=11
+cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
+restartsb
+sleep 3
+green "测试SOCKS5落地连通性……"
+if [[ -n $s5user ]]; then
+landing_ip=$(curl -sm8 --socks5 "${s5ip}:${s5port}" -U "${s5user}:${s5pass}" icanhazip.com 2>/dev/null)
+else
+landing_ip=$(curl -sm8 --socks5 "${s5ip}:${s5port}" icanhazip.com 2>/dev/null)
+fi
+if [[ -z $landing_ip ]]; then
+vps_ip=$(curl -sm5 icanhazip.com 2>/dev/null)
+yellow "⚠ 无法通过SOCKS5获取落地IP，当前VPS出口IP：$vps_ip"
+yellow "请检查SOCKS5服务器地址、端口、认证是否正确"
+else
+green "✓ SOCKS5落地代理配置成功！落地IP：$landing_ip"
+fi
+elif [ "$menu" = "2" ]; then
+if [[ ! -f /etc/s-box/ext_socks5.conf ]]; then
+red "未配置外部SOCKS5落地代理" && return
+fi
+local s5ip s5port s5user s5pass
+s5ip=$(awk '{print $1}' /etc/s-box/ext_socks5.conf)
+s5port=$(awk '{print $2}' /etc/s-box/ext_socks5.conf)
+s5user=$(awk '{print $3}' /etc/s-box/ext_socks5.conf)
+s5pass=$(awk '{print $4}' /etc/s-box/ext_socks5.conf)
+echo
+green "SOCKS5落地代理：${s5ip}:${s5port}"
+[[ -n $s5user ]] && green "认证用户名：$s5user"
+echo
+green "测试落地IP中……"
+if [[ -n $s5user ]]; then
+landing_ip=$(curl -sm8 --socks5 "${s5ip}:${s5port}" -U "${s5user}:${s5pass}" icanhazip.com 2>/dev/null)
+else
+landing_ip=$(curl -sm8 --socks5 "${s5ip}:${s5port}" icanhazip.com 2>/dev/null)
+fi
+if [[ -z $landing_ip ]]; then
+red "✗ 通过SOCKS5获取落地IP失败，请检查配置或服务器状态"
+else
+green "✓ 当前落地IP（经SOCKS5出口）：$landing_ip"
+fi
+elif [ "$menu" = "3" ]; then
+socks5_export_nodes
+elif [ "$menu" = "4" ]; then
+if [[ ! -f /etc/s-box/ext_socks5.conf ]]; then
+yellow "当前未启用SOCKS5落地代理" && return
+fi
+remove_ext_socks5
+[[ "$sbnh" == "1.10" ]] && num=10 || num=11
+cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
+restartsb
+green "已关闭SOCKS5落地代理，恢复VPS本地直连"
+rm -rf /etc/s-box/{s5_sbox.json,s5_clmi.yaml,s5_jhsub.txt}
+else
+socks5_landing
+fi
 }
 
 sbservice(){
@@ -2534,7 +2682,7 @@ inssbjsonser
 sbservice
 sbactive
 #curl -sL https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/version/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
+curl -sL https://raw.githubusercontent.com/bitbyte404/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 lnsb && blue "Sing-box-yg脚本安装成功，脚本快捷方式：sb" && cronsb
 echo
@@ -3817,7 +3965,7 @@ rm /tmp/crontab.tmp
 
 lnsb(){
 rm -rf /usr/bin/sb
-curl -L -o /usr/bin/sb -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh
+curl -L -o /usr/bin/sb -# --retry 2 --insecure https://raw.githubusercontent.com/bitbyte404/sing-box-yg/main/sb.sh
 chmod +x /usr/bin/sb
 }
 
@@ -3826,7 +3974,7 @@ if [[ ! -f '/usr/bin/sb' ]]; then
 red "未正常安装Sing-box-yg" && exit
 fi
 lnsb
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
+curl -sL https://raw.githubusercontent.com/bitbyte404/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 green "Sing-box-yg安装脚本升级成功" && sleep 5 && sb
 }
 
@@ -3917,7 +4065,7 @@ iptables -t nat -F PREROUTING >/dev/null 2>&1
 netfilter-persistent save >/dev/null 2>&1
 service iptables save >/dev/null 2>&1
 green "Sing-box卸载完成！"
-blue "欢迎继续使用Sing-box-yg脚本：bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)"
+blue "欢迎继续使用Sing-box-yg脚本：bash <(curl -Ls https://raw.githubusercontent.com/bitbyte404/sing-box-yg/main/sb.sh)"
 echo
 }
 
@@ -3938,6 +4086,11 @@ fi
 }
 
 sbshare(){
+if [[ -f /etc/s-box/ext_socks5.conf ]]; then
+local _s5disp
+_s5disp="$(awk '{print $1":"$2}' /etc/s-box/ext_socks5.conf)"
+yellow "⚠ 已启用外部SOCKS5落地代理：${_s5disp}，以下节点落地IP均为SOCKS5出口IP"
+fi
 rm -rf /etc/s-box/{jhdy,vl_reality,vm_ws_argols,vm_ws_argogd,vm_ws,vm_ws_tls,hy2,tuic5,an}.txt
 result_vl_vm_hy_tu && resvless && resvmess && reshy2 && restu5
 if [[ "$sbnh" != "1.10" ]]; then
@@ -4145,7 +4298,7 @@ case $(uname -m) in
 aarch64) cpu=arm64;;
 x86_64) cpu=amd64;;
 esac
-curl -L -o /etc/s-box/sbwpph -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sbwpph_$cpu
+curl -L -o /etc/s-box/sbwpph -# --retry 2 --insecure https://raw.githubusercontent.com/bitbyte404/sing-box-yg/main/sbwpph_$cpu
 chmod +x /etc/s-box/sbwpph
 fi
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
@@ -4285,7 +4438,7 @@ blue "sing-box-yg脚本视频教程：https://www.youtube.com/playlist?list=PLMg
 echo
 blue "sing-box-yg脚本博客说明：http://ygkkk.blogspot.com/2023/10/sing-box-yg.html"
 echo
-blue "sing-box-yg脚本项目地址：https://github.com/yonggekkk/sing-box-yg"
+blue "sing-box-yg脚本项目地址：https://github.com/bitbyte404/sing-box-yg"
 echo
 blue "推荐甬哥新品：ArgoSBX一键无交互小钢炮脚本"
 blue "ArgoSBX项目地址：https://github.com/yonggekkk/argosbx"
@@ -4325,20 +4478,21 @@ green "12. 管理 Acme 申请域名证书"
 green "13. 管理 Warp 查看Netflix/ChatGPT解锁情况"
 green "14. 添加 WARP-plus-Socks5 代理模式 【本地Warp/多地区Psiphon-VPN】"
 green "15. 刷新本地IP、调整IPV4/IPV6配置输出"
+green "17. 管理外部SOCKS5落地代理 【更改落地IP/导出节点】"
 white "----------------------------------------------------------------------------------"
 green "16. Sing-box-yg脚本使用说明书"
 white "----------------------------------------------------------------------------------"
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 insV=$(cat /etc/s-box/v 2>/dev/null)
-latestV=$(curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1)
+latestV=$(curl -sL https://raw.githubusercontent.com/bitbyte404/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1)
 if [ -f /etc/s-box/v ]; then
 if [ "$insV" = "$latestV" ]; then
 echo -e "当前 Sing-box-yg 脚本最新版：${bblue}${insV}${plain} (已安装)"
 else
 echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${insV}${plain}"
 echo -e "检测到最新 Sing-box-yg 脚本版本号：${yellow}${latestV}${plain} (可选择7进行更新)"
-echo -e "${yellow}$(curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version)${plain}"
+echo -e "${yellow}$(curl -sL https://raw.githubusercontent.com/bitbyte404/sing-box-yg/main/version)${plain}"
 fi
 else
 echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${latestV}${plain}"
@@ -4439,15 +4593,15 @@ showprotocol
 fi
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
-readp "请输入数字【0-16】:" Input
-case "$Input" in  
+readp "请输入数字【0-17】:" Input
+case "$Input" in
  1 ) instsllsingbox;;
  2 ) unins;;
  3 ) changeserv;;
  4 ) changeport;;
  5 ) changefl;;
  6 ) stclre;;
- 7 ) upsbyg;; 
+ 7 ) upsbyg;;
  8 ) upsbcroe;;
  9 ) clash_sb_share;;
 10 ) sblog;;
@@ -4457,5 +4611,6 @@ case "$Input" in
 14 ) inssbwpph;;
 15 ) wgcfgo && sbshare;;
 16 ) sbsm;;
- * ) exit 
+17 ) socks5_landing;;
+ * ) exit
 esac
